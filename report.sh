@@ -17,6 +17,15 @@ trap 'rm -rf "$TMP"' EXIT
 # Shared awk helper, same output as fmt() in lib.sh
 AWK_FMT='function fmt(n) { return n >= 1000000 ? sprintf("%.1fM", n/1000000) : (n >= 1000 ? sprintf("%.1fk", n/1000) : sprintf("%d", n)) }'
 
+# Shared awk UI helpers: colour only when c=1; dim labels, bold header
+AWK_UI='function esc(code) { return c ? sprintf("%c[%sm", 27, code) : "" }
+function lab(s) { return esc("2") sprintf("%-16s", s) esc("0") }
+function rule() { return esc("2") "────────────────────────────────────" esc("0") }'
+
+# Colour only on a terminal, and not when NO_COLOR is set
+COLOR=0
+[ -t 1 ] && [ -z "${NO_COLOR:-}" ] && COLOR=1
+
 # Data rows, one per prompt. A prompt can be logged twice when two Claude
 # sessions run at once; keep the last copy.
 rows() {
@@ -85,32 +94,92 @@ rollup() {
 }
 
 session_report() {
-  local start=$1 secs=$2 dur
+  local start=$1 secs=$2 dur med
   rows | awk -F, -v s="$start" '$1 >= s' > "$TMP/session"
   [ -s "$TMP/session" ] || return 1
 
   if (( secs >= 3600 )); then dur="$(( secs / 3600 ))h $(( secs % 3600 / 60 ))m"
   else dur="$(( secs / 60 ))m"; fi
+  med=$(cut -d, -f8 "$TMP/session" | median)
 
-  awk -F, -v dur="$dur" "$AWK_FMT"'
+  awk -F, -v dur="$dur" -v secs="$secs" -v med="$med" -v big="$BIG" -v c="$COLOR" \
+    "$AWK_FMT$AWK_UI"'
+    # Julian day * 86400 + time of day: seconds on a continuous scale
+    function stamp(ts,   y, m, d, a, y2, m2) {
+      y = substr(ts, 1, 4) + 0; m = substr(ts, 6, 2) + 0; d = substr(ts, 9, 2) + 0
+      a = int((14 - m) / 12); y2 = y + 4800 - a; m2 = m + 12 * a - 3
+      return (d + int((153 * m2 + 2) / 5) + 365 * y2 + int(y2 / 4) - int(y2 / 100) + int(y2 / 400) - 32045) * 86400 \
+             + substr(ts, 12, 2) * 3600 + substr(ts, 15, 2) * 60 + substr(ts, 18, 2)
+    }
+    function clock(mins) { mins = mins % 1440; return sprintf("%02d:%02d", int(mins / 60), mins % 60) }
+    function bar(name, p, was,   k, i, out) {
+      k = int(p * 12 / 100 + 0.5); if (p > 0 && k < 1) k = 1; if (k > 12) k = 12
+      out = (p >= 90 ? esc("31") : (p >= 70 ? esc("33") : ""))
+      for (i = 1; i <= k; i++) out = out "█"
+      out = out esc("0") esc("2")
+      for (i = k + 1; i <= 12; i++) out = out "░"
+      printf "%s%-9s%s%s%s %3d%%  (was %d%%)\n", esc("2"), name, esc("0"), out, esc("0"), p, was
+    }
+    BEGIN { sp[1]="▁"; sp[2]="▂"; sp[3]="▃"; sp[4]="▄"; sp[5]="▅"; sp[6]="▆"; sp[7]="▇"; sp[8]="█" }
     { n++; tok += $8; sent += $9; got += $10
       if ($8 > max) max = $8
+      if ($8 > big) b++
+      S[n] = $9; T[n] = stamp($1); clk[n] = substr($1, 12, 5)
+      if (!($5 in mc)) mo[++nm] = $5
+      mc[$5]++
       if ($11 != "") { if (f5 == "") f5 = $11; l5 = $11 }
       if ($12 != "") { if (f7 == "") f7 = $12; l7 = $12 } }
     END {
+      long = (n >= 10 || secs >= 1800)
       print ""
-      print "── Claude session ─────────────────────────────"
-      printf " Prompts      %-6d   Duration  %s\n", n, dur
-      printf " Prompt size  avg ~%s tok   longest ~%s tok\n", fmt(tok / n), fmt(max)
-      printf " Context      avg %s sent · %s got per prompt\n", fmt(sent / n), fmt(got / n)
-      if (sent > 0) printf " Your text    %.1f%% of what was sent\n", 100 * tok / sent
-      if (f5 != "" || f7 != "") {
-        u = " Usage       "
-        if (f5 != "") u = u sprintf(" 5h %d%% → %d%%", f5, l5)
-        if (f7 != "") u = u sprintf("   7d %d%% → %d%%", f7, l7)
-        print u
+      printf "%sClaude session · %s · %d prompt%s%s\n", esc("1"), dur, n, (n == 1 ? "" : "s"), esc("0")
+      print rule()
+      printf "%s~%s tok median · longest ~%s\n", lab("Prompt size"), fmt(med), fmt(max)
+      if (long) printf "%s%d over %d tok\n", lab("Long prompts"), b, big
+      printf "%savg %s per prompt\n", lab("Context"), fmt(sent / n)
+      printf "%savg %s per prompt\n", lab("Reply"), fmt(got / n)
+      if (sent > 0) printf "%s%.1f%% of input\n", lab("Your share"), 100 * tok / sent
+
+      if (long) {
+        print ""
+        if (n >= 2) {
+          pts = (n < 12 ? n : 12); lo = hi = S[1]
+          for (i = 2; i <= n; i++) { if (S[i] < lo) lo = S[i]; if (S[i] > hi) hi = S[i] }
+          line = ""
+          for (k = 1; k <= pts; k++) {
+            v = S[int((k - 1) * (n - 1) / (pts - 1) + 1)]
+            lv = (hi > lo) ? int((v - lo) / (hi - lo) * 7) + 1 : 1
+            line = line sp[lv]
+          }
+          printf "%s%s → %s   %s\n", lab("Context growth"), fmt(S[1]), fmt(S[n]), line
+        }
+        gap = secs / n
+        pace = (gap >= 60) ? sprintf("1 prompt / %dm", gap / 60 + 0.5) : sprintf("1 prompt / %ds", gap)
+        # busiest 30-minute window, anchored at a prompt
+        best = 0
+        for (i = 1; i <= n; i++) {
+          cnt = 0
+          for (j = i; j <= n && T[j] - T[i] < 1800; j++) cnt++
+          if (cnt > best) { best = cnt; bi = i }
+        }
+        if (n >= 10) {
+          m0 = substr(clk[bi], 1, 2) * 60 + substr(clk[bi], 4, 2)
+          pace = pace sprintf(" · busiest %s–%s (%d)", clk[bi], clock(m0 + 30), best)
+        }
+        printf "%s%s\n", lab("Pace"), pace
       }
-      print "───────────────────────────────────────────────"
+
+      models = ""
+      for (i = 1; i <= nm; i++)
+        models = models (i > 1 ? " · " : "") mo[i] (nm > 1 ? sprintf(" (%d)", mc[mo[i]]) : "")
+      printf "%s%s\n", lab("Models"), models
+
+      if (f5 != "" || f7 != "") {
+        print ""
+        if (f5 != "") bar("5h limit", l5, f5)
+        if (f7 != "") bar("7d limit", l7, f7)
+      }
+      print rule()
     }' "$TMP/session"
 }
 
@@ -123,7 +192,7 @@ alltime_report() {
   local med
   med=$(cut -d, -f8 "$TMP/rows" | median)
 
-  awk -F, -v med="$med" -v every="$EVERY" -v big="$BIG" -v monthly="$MONTHLY" "$AWK_FMT"'
+  awk -F, -v med="$med" -v every="$EVERY" -v big="$BIG" -v monthly="$MONTHLY" -v c="$COLOR" "$AWK_FMT$AWK_UI"'
     BEGIN {
       while ((getline l < monthly) > 0) {
         if (l ~ /^month,/) continue
@@ -142,24 +211,25 @@ alltime_report() {
       for (k in sess) s++
       if (since == "") since = first
       print ""
-      printf "── All-time (since %s) · %d prompts · %d sessions ──\n", since, total, s
-      line = sprintf(" Prompt size  avg ~%s tok", fmt((tok + mtok) / total))
-      if (n) line = line sprintf("   median ~%s%s", fmt(med), mn ? " (recent)" : "")
-      print line sprintf("   longest ~%s", fmt(max))
-      printf " Big prompts  %d over %d tok (%d%%)\n", b + mb, big, 100 * (b + mb) / total
+      printf "%sClaude all-time · since %s · %d prompts · %d session%s%s\n", esc("1"), since, total, s, (s == 1 ? "" : "s"), esc("0")
+      print rule()
+      line = sprintf("avg ~%s tok", fmt((tok + mtok) / total))
+      if (n) line = line sprintf(" · median ~%s%s", fmt(med), mn ? " (recent)" : "")
+      print lab("Prompt size") line sprintf(" · longest ~%s", fmt(max))
+      printf "%s%d over %d tok (%d%%)\n", lab("Big prompts"), b + mb, big, 100 * (b + mb) / total
       if (n >= 2 * every) {
         for (i = n - every + 1; i <= n; i++) r += t[i]
         for (i = n - 2 * every + 1; i <= n - every; i++) p += t[i]
         r /= every; p /= every
         trend = (r < 0.9 * p) ? "shrinking" : ((r > 1.1 * p) ? "growing" : "steady")
-        printf " Trend        last %d avg ~%s tok (previous %d: ~%s) → %s\n", every, fmt(r), every, fmt(p), trend
+        printf "%slast %d avg ~%s tok (previous %d: ~%s) → %s\n", lab("Trend"), every, fmt(r), every, fmt(p), trend
       }
-      printf " Context      avg %s sent per prompt\n", fmt((sent + msent) / total)
+      printf "%savg %s per prompt\n", lab("Context"), fmt((sent + msent) / total)
       if (n) {
         for (k in proj) if (proj[k] > pm) { pm = proj[k]; pk = k }
-        printf " Busiest      %s (%d prompts)\n", pk, pm
+        printf "%s%s (%d prompts)\n", lab("Busiest"), pk, pm
       }
-      print "───────────────────────────────────────────────"
+      print rule()
     }' "$TMP/rows"
 }
 
