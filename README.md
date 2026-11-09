@@ -24,6 +24,28 @@ prompt ~97 │ sent 48.2k · got 912 │ 5h 34% · 7d 81%
 **Session report** when you quit `claude`, and an **all-time report** every
 `CLAUDE_REPORT_EVERY` prompts or on demand with `claude-stats`.
 
+```
+Claude session · 1h 42m · 34 prompts
+────────────────────────────────────
+Prompt size    ~57 tok median · longest ~612
+Long prompts   1 over 250 tok
+Context        avg 68.8k per prompt
+Reply          avg 1.1k per prompt
+Your share     0.1% of input
+
+Context growth 20.9k → 116.6k   ▁▁▂▂▃▄▄▅▆▆▇█
+Pace           1 prompt / 3m · busiest 14:24–14:54 (13)
+Models         Sonnet 5.5 (30) · Opus 5.5 (4)
+
+5h limit █████░░░░░░░  45%  (was 12%)
+7d limit ██░░░░░░░░░░  15%  (was 15%)
+────────────────────────────────────
+```
+
+Sessions under 10 prompts and 30 minutes skip the `Long prompts`, `Context growth` and
+`Pace` lines. `(was N%)` is the plan usage at the session's first prompt. Limit bars turn
+yellow at 70% and red at 90%. Colour is only used on a terminal; set `NO_COLOR` to turn it off.
+
 ## Install
 
 Requires `jq` (built into macOS). [Oh My Posh](https://ohmyposh.dev) is optional; without
@@ -81,4 +103,5 @@ Stored in `~/.claude/prompt-tracking/`, not in this repo. Prompt text is never r
 
 - Prompt sizes are estimates. Everything else comes from the numbers Anthropic reports to Claude Code.
 - `sent` is the context of each prompt's last API call, not the sum of every call during the prompt.
+- `Reply` is Claude's output on each prompt's last API call, so it understates prompts with several tool-use steps.
 - Only terminal sessions started with the `claude` wrapper get exit reports. Claude Desktop isn't tracked.
